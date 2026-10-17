@@ -17,14 +17,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Tự dò thư mục chứa buildozer.spec: chạy được dù bạn upload project ở gốc repo hay trong thư mục con
-      # (vd repo/pyea-runner/buildozer.spec).
-      - name: Locate project (buildozer.spec)
+      # Tự tìm dự án: (1) buildozer.spec nằm ở gốc repo hoặc thư mục con; (2) nếu repo chỉ chứa FILE .zip của dự án
+      # (upload nguyên file zip lên GitHub - GitHub KHÔNG tự giải nén) thì tự giải nén zip đó rồi build.
+      - name: Locate project (buildozer.spec / tự giải nén zip)
         id: proj
+        shell: bash
         run: |
-          SPEC=$(find . -maxdepth 4 -name buildozer.spec -not -path "*/.buildozer/*" | head -n 1)
+          find_spec() { find "$1" -maxdepth 4 -name buildozer.spec -not -path "*/.buildozer/*" -not -path "*/.git/*" | head -n 1; }
+          SPEC=$(find_spec .)
           if [ -z "$SPEC" ]; then
-            echo "::error::Không tìm thấy buildozer.spec trong repo. Cấu trúc thư mục hiện có:"
+            echo "Không thấy buildozer.spec -> tìm file .zip chứa dự án để giải nén..."
+            while IFS= read -r Z; do
+              if unzip -Z1 "$Z" 2>/dev/null | grep -q 'buildozer.spec$'; then
+                echo "Giải nén: $Z"
+                rm -rf _src && mkdir -p _src && unzip -q -o "$Z" -d _src
+                break
+              fi
+            done < <(find . -maxdepth 4 -name '*.zip' -not -path "./.git/*" -not -path "./_src/*")
+            SPEC=$(find_spec ./_src)
+          fi
+          if [ -z "$SPEC" ]; then
+            echo "::error::Không tìm thấy buildozer.spec (cũng không có file .zip nào chứa nó). Hãy giải nén pyea-runner.zip rồi đẩy các file bên trong lên repo. Cấu trúc hiện có:"
             find . -maxdepth 3 -not -path "./.git/*" | head -n 60
             exit 1
           fi
