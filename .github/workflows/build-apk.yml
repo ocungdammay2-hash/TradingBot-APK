@@ -13,12 +13,12 @@ jobs:
   build:
     # ubuntu-22.04: cần libtinfo5 (không có trên 24.04)
     runs-on: ubuntu-22.04
-    timeout-minutes: 120
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
 
       # Tự tìm dự án: (1) buildozer.spec nằm ở gốc repo hoặc thư mục con; (2) nếu repo chỉ chứa FILE .zip của dự án
-      # (upload nguyên file zip lên GitHub - GitHub KHÔNG tự giải nén) thì tự giải nén zip đó rồi build.
+      # (upload nguyên file zip - GitHub KHÔNG tự giải nén) thì tự giải nén zip đó rồi build.
       - name: Locate project (buildozer.spec / tự giải nén zip)
         id: proj
         shell: bash
@@ -50,20 +50,31 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Cache buildozer (SDK/NDK + p4a)
-        uses: actions/cache@v4
+      # BẮT BUỘC JDK 17: máy chủ GitHub mặc định dùng JDK 11 (JAVA_HOME trỏ tới Temurin 11), còn Gradle/AGP của
+      # python-for-android và sdkmanager cần JDK 17. setup-java đặt lại JAVA_HOME (buildozer tự dùng JAVA_HOME).
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # Khôi phục cache (SDK/NDK/p4a đã tải + phần đã biên dịch). Cache được LƯU CẢ KHI BUILD LỖI (bước 'Save cache')
+      # nên lần chạy lại không phải làm lại từ đầu.
+      - name: Restore cache
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.buildozer
             ${{ steps.proj.outputs.dir }}/.buildozer
-          key: buildozer-${{ runner.os }}-${{ hashFiles('**/buildozer.spec') }}
-          restore-keys: buildozer-${{ runner.os }}-
+          key: buildozer-${{ runner.os }}-${{ hashFiles('**/buildozer.spec') }}-${{ github.run_id }}
+          restore-keys: |
+            buildozer-${{ runner.os }}-${{ hashFiles('**/buildozer.spec') }}-
+            buildozer-${{ runner.os }}-
 
       - name: System dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            git zip unzip openjdk-17-jdk autoconf automake libtool pkg-config \
+            git zip unzip autoconf automake libtool pkg-config \
             zlib1g-dev libncurses5-dev libncursesw5-dev libtinfo5 cmake \
             libffi-dev libssl-dev build-essential ccache
 
@@ -72,9 +83,56 @@ jobs:
           python -m pip install --upgrade pip
           pip install buildozer==1.5.0 "cython==0.29.37" virtualenv setuptools
 
+      - name: Versions
+        run: |
+          echo "JAVA_HOME=$JAVA_HOME"
+          java -version
+          javac -version
+          python --version
+          buildozer --version || true
+
       - name: Build debug APK
         working-directory: ${{ steps.proj.outputs.dir }}
-        run: buildozer -v android debug
+        shell: bash
+        run: |
+          set -o pipefail
+          buildozer -v android debug 2>&1 | tee build.log
+
+      - name: Save cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.buildozer
+            ${{ steps.proj.outputs.dir }}/.buildozer
+          key: buildozer-${{ runner.os }}-${{ hashFiles('**/buildozer.spec') }}-${{ github.run_id }}
+
+      # Log buildozer rất dài nên giao diện GitHub hay cắt mất dòng lỗi: in riêng phần lỗi ở đây.
+      - name: Show error summary
+        if: failure()
+        working-directory: ${{ steps.proj.outputs.dir }}
+        shell: bash
+        run: |
+          LOG=build.log
+          [ -f "$LOG" ] || { echo "Không có build.log (lỗi xảy ra trước khi build)"; exit 0; }
+          {
+            echo "### Các dòng lỗi trong log buildozer"
+            echo '```'
+            grep -n -i -E "error|exception|failed|not found|traceback|FAILURE|could not|requires java" "$LOG" | tail -n 40
+            echo '```'
+            echo "### 80 dòng cuối"
+            echo '```'
+            tail -n 80 "$LOG"
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload full build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: buildozer-log
+          path: ${{ steps.proj.outputs.dir }}/build.log
+          if-no-files-found: ignore
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
