@@ -17,6 +17,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Tự dò thư mục chứa buildozer.spec: chạy được dù bạn upload project ở gốc repo hay trong thư mục con
+      # (vd repo/pyea-runner/buildozer.spec).
+      - name: Locate project (buildozer.spec)
+        id: proj
+        run: |
+          SPEC=$(find . -maxdepth 4 -name buildozer.spec -not -path "*/.buildozer/*" | head -n 1)
+          if [ -z "$SPEC" ]; then
+            echo "::error::Không tìm thấy buildozer.spec trong repo. Cấu trúc thư mục hiện có:"
+            find . -maxdepth 3 -not -path "./.git/*" | head -n 60
+            exit 1
+          fi
+          DIR=$(dirname "$SPEC")
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+          echo "Dự án nằm ở: $DIR"
+          ls -la "$DIR"
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -26,8 +42,8 @@ jobs:
         with:
           path: |
             ~/.buildozer
-            .buildozer
-          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+            ${{ steps.proj.outputs.dir }}/.buildozer
+          key: buildozer-${{ runner.os }}-${{ hashFiles('**/buildozer.spec') }}
           restore-keys: buildozer-${{ runner.os }}-
 
       - name: System dependencies
@@ -44,17 +60,18 @@ jobs:
           pip install buildozer==1.5.0 "cython==0.29.37" virtualenv setuptools
 
       - name: Build debug APK
+        working-directory: ${{ steps.proj.outputs.dir }}
         run: buildozer -v android debug
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: pyearunner-apk
-          path: bin/*.apk
+          path: ${{ steps.proj.outputs.dir }}/bin/*.apk
           if-no-files-found: error
 
       - name: Attach APK to GitHub Release (khi push tag v*)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: bin/*.apk
+          files: ${{ steps.proj.outputs.dir }}/bin/*.apk
