@@ -23,19 +23,28 @@ jobs:
         id: proj
         shell: bash
         run: |
-          find_spec() { find "$1" -maxdepth 4 -name buildozer.spec -not -path "*/.buildozer/*" -not -path "*/.git/*" | head -n 1; }
+          # Nhiều bản buildozer.spec (vd bản cũ còn sót trong repo): CHỌN BẢN CÓ version CAO NHẤT và in danh sách, để không bao giờ build nhầm bản cũ.
+          find_spec() {
+            local best="" bestv="" f v
+            while IFS= read -r f; do
+              v=$(grep -m1 -E '^version *=' "$f" | sed -E 's/^version *= *//; s/[[:space:]]+$//')
+              echo "  ứng viên: $f (version=$v)" >&2
+              if [ -z "$best" ] || [ "$(printf '%s\n%s\n' "$bestv" "$v" | sort -V | tail -n1)" = "$v" ]; then best="$f"; bestv="$v"; fi
+            done < <(find "$1" -maxdepth 4 -name buildozer.spec -not -path "*/.buildozer/*" -not -path "*/.git/*")
+            [ -n "$best" ] && echo "  => chọn: $best (version=$bestv)" >&2
+            echo "$best"
+          }
+          # Giải nén MỌI file .zip có chứa buildozer.spec (mỗi file một thư mục riêng) rồi chọn bản có version CAO NHẤT giữa cả file rời lẫn trong zip:
+          # một file zip cũ còn nằm trong repo (vd .github/workflows/pyea-runner.zip) không còn che mất bản mới.
+          rm -rf _src && mkdir -p _src
+          N=0
+          while IFS= read -r Z; do
+            if unzip -Z1 "$Z" 2>/dev/null | grep -q 'buildozer.spec$'; then
+              N=$((N+1)); echo "Giải nén: $Z -> _src/$N"
+              mkdir -p "_src/$N" && unzip -q -o "$Z" -d "_src/$N"
+            fi
+          done < <(find . -maxdepth 4 -name '*.zip' -not -path "./.git/*" -not -path "./_src/*")
           SPEC=$(find_spec .)
-          if [ -z "$SPEC" ]; then
-            echo "Không thấy buildozer.spec -> tìm file .zip chứa dự án để giải nén..."
-            while IFS= read -r Z; do
-              if unzip -Z1 "$Z" 2>/dev/null | grep -q 'buildozer.spec$'; then
-                echo "Giải nén: $Z"
-                rm -rf _src && mkdir -p _src && unzip -q -o "$Z" -d _src
-                break
-              fi
-            done < <(find . -maxdepth 4 -name '*.zip' -not -path "./.git/*" -not -path "./_src/*")
-            SPEC=$(find_spec ./_src)
-          fi
           if [ -z "$SPEC" ]; then
             echo "::error::Không tìm thấy buildozer.spec (cũng không có file .zip nào chứa nó). Hãy giải nén pyea-runner.zip rồi đẩy các file bên trong lên repo. Cấu trúc hiện có:"
             find . -maxdepth 3 -not -path "./.git/*" | head -n 60
@@ -65,10 +74,11 @@ jobs:
           path: |
             ~/.buildozer
             ${{ steps.proj.outputs.dir }}/.buildozer
-          key: buildozer-${{ runner.os }}-${{ hashFiles('**/buildozer.spec') }}-${{ github.run_id }}
+          # v3: đổi tiền tố để bỏ cache cũ (từng chứa dist Gradle của p4a bản cũ: AGP 8.1 + jcenter => 'Could not find kxml2/guava...').
+          # Chỉ khôi phục cache CÙNG buildozer.spec (đã gồm p4a.branch/api/ndk); KHÔNG còn restore-key rộng 'buildozer-Linux-'.
+          key: buildozer-v3-${{ runner.os }}-${{ hashFiles('**/buildozer.spec') }}-${{ github.run_id }}
           restore-keys: |
-            buildozer-${{ runner.os }}-${{ hashFiles('**/buildozer.spec') }}-
-            buildozer-${{ runner.os }}-
+            buildozer-v3-${{ runner.os }}-${{ hashFiles('**/buildozer.spec') }}-
 
       - name: System dependencies
         run: |
@@ -81,7 +91,7 @@ jobs:
       - name: Install buildozer
         run: |
           python -m pip install --upgrade pip
-          pip install buildozer==1.5.0 "cython==0.29.37" virtualenv setuptools
+          pip install --upgrade buildozer "cython==0.29.37" virtualenv setuptools
 
       - name: Versions
         run: |
@@ -91,12 +101,36 @@ jobs:
           python --version
           buildozer --version || true
 
+      # Dist Gradle (do p4a sinh ra từ template) KHÔNG được dùng lại từ cache: dist cũ có AGP/jcenter của p4a bản cũ -> Gradle không tải được thư viện.
+      # Xoá riêng thư mục dists (phần đã biên dịch python/kivy/NDK vẫn giữ nên không mất 30-60 phút); p4a dựng lại dist từ template mới.
+      - name: Drop stale p4a dist (giữ phần đã biên dịch)
+        working-directory: ${{ steps.proj.outputs.dir }}
+        shell: bash
+        run: |
+          for d in .buildozer/android/platform/build-*/dists ~/.buildozer/android/platform/build-*/dists; do
+            [ -d "$d" ] && { echo "Xoá dist cũ: $d"; rm -rf "$d"; }
+          done
+          P4A=~/.buildozer/android/platform/python-for-android
+          [ -d "$P4A/.git" ] && git -C "$P4A" describe --tags --always 2>/dev/null | sed 's/^/p4a trong cache: /' || true
+          true
+
       - name: Build debug APK
         working-directory: ${{ steps.proj.outputs.dir }}
         shell: bash
         run: |
           set -o pipefail
           buildozer -v android debug 2>&1 | tee build.log
+
+      # Kiểm tra manifest cuối cùng có BootReceiver + quyền khởi động (hook tools/p4a_hook.py chèn). Thiếu -> báo lỗi rõ ràng thay vì im lặng.
+      - name: Verify boot receiver in manifest
+        working-directory: ${{ steps.proj.outputs.dir }}
+        shell: bash
+        run: |
+          M=$(find .buildozer -path "*src/main/AndroidManifest.xml" 2>/dev/null | head -n 1)
+          [ -n "$M" ] || { echo "::error::Không thấy AndroidManifest.xml đã dựng"; exit 1; }
+          grep -q "org.pyea.pyearunner.BootReceiver" "$M" || { echo "::error::Manifest thiếu BootReceiver (hook p4a không chạy?)"; exit 1; }
+          grep -q "RECEIVE_BOOT_COMPLETED" "$M" || { echo "::error::Manifest thiếu RECEIVE_BOOT_COMPLETED"; exit 1; }
+          echo "OK: $M có BootReceiver"
 
       - name: Save cache
         if: always()
@@ -105,7 +139,7 @@ jobs:
           path: |
             ~/.buildozer
             ${{ steps.proj.outputs.dir }}/.buildozer
-          key: buildozer-${{ runner.os }}-${{ hashFiles('**/buildozer.spec') }}-${{ github.run_id }}
+          key: buildozer-v3-${{ runner.os }}-${{ hashFiles('**/buildozer.spec') }}-${{ github.run_id }}
 
       # Log buildozer rất dài nên giao diện GitHub hay cắt mất dòng lỗi: in riêng phần lỗi ở đây.
       - name: Show error summary
