@@ -103,12 +103,15 @@ jobs:
 
       # Dist Gradle (do p4a sinh ra từ template) KHÔNG được dùng lại từ cache: dist cũ có AGP/jcenter của p4a bản cũ -> Gradle không tải được thư viện.
       # Xoá riêng thư mục dists (phần đã biên dịch python/kivy/NDK vẫn giữ nên không mất 30-60 phút); p4a dựng lại dist từ template mới.
+      # Cũng xoá venv công cụ của p4a (build-*/build/venv): venv cũ từ cache + `python -m venv` của p4a (cài pip 25.3 đóng gói đè lên pip 26.x)
+      # => pip bị «lai» => ImportError 'capture_logging' (HANDOFF 5bl). Phần module đã cài nằm ở python-installs nên không mất.
       - name: Drop stale p4a dist (giữ phần đã biên dịch)
         working-directory: ${{ steps.proj.outputs.dir }}
         shell: bash
         run: |
-          for d in .buildozer/android/platform/build-*/dists ~/.buildozer/android/platform/build-*/dists; do
-            [ -d "$d" ] && { echo "Xoá dist cũ: $d"; rm -rf "$d"; }
+          for d in .buildozer/android/platform/build-*/dists ~/.buildozer/android/platform/build-*/dists \
+                   .buildozer/android/platform/build-*/build/venv ~/.buildozer/android/platform/build-*/build/venv; do
+            [ -e "$d" ] && { echo "Xoá thư mục cũ: $d"; rm -rf "$d"; }
           done
           P4A=~/.buildozer/android/platform/python-for-android
           [ -d "$P4A/.git" ] && git -C "$P4A" describe --tags --always 2>/dev/null | sed 's/^/p4a trong cache: /' || true
@@ -119,7 +122,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          # Cấm pip chọn wheel Android biên dịch của charset-normalizer (xem tools/p4a_constraints.txt): p4a 2026 sẽ cài nó bằng pip máy host và lỗi.
+          # Cấm pip chọn wheel Android biên dịch của charset-normalizer và ghim pip 25.3 trong venv p4a (xem tools/p4a_constraints.txt; HANDOFF 5bk, 5bl).
           export PIP_CONSTRAINT="$PWD/tools/p4a_constraints.txt"
           [ -f "$PIP_CONSTRAINT" ] || { echo "::error::thiếu $PIP_CONSTRAINT"; exit 1; }
           buildozer -v android debug 2>&1 | tee build.log
@@ -157,6 +160,10 @@ jobs:
             echo '```'
             grep -n -i -E "error|exception|failed|not found|traceback|FAILURE|could not|requires java" "$LOG" | tail -n 40
             echo '```'
+            if grep -q "capture_logging" "$LOG"; then
+              echo "### Gợi ý: pip trong venv của p4a bị «lai» phiên bản (HANDOFF 5bl)"
+              echo "Kiểm: buildozer.spec có 'pyeapipfix' trong requirements và 'p4a.local_recipes = tools/p4a_recipes'; tools/p4a_constraints.txt có 'pip==25.3'."
+            fi
             echo "### 80 dòng cuối"
             echo '```'
             tail -n 80 "$LOG"
