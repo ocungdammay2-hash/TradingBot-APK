@@ -119,6 +119,9 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          # Cấm pip chọn wheel Android biên dịch của charset-normalizer (xem tools/p4a_constraints.txt): p4a 2026 sẽ cài nó bằng pip máy host và lỗi.
+          export PIP_CONSTRAINT="$PWD/tools/p4a_constraints.txt"
+          [ -f "$PIP_CONSTRAINT" ] || { echo "::error::thiếu $PIP_CONSTRAINT"; exit 1; }
           buildozer -v android debug 2>&1 | tee build.log
 
       # Kiểm tra manifest cuối cùng có BootReceiver + quyền khởi động (hook tools/p4a_hook.py chèn). Thiếu -> báo lỗi rõ ràng thay vì im lặng.
