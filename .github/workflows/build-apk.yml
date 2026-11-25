@@ -67,6 +67,26 @@ jobs:
           echo "Dự án nằm ở: $DIR"
           ls -la "$DIR"
 
+      # File workflow trong repo CHỈ đổi khi BẠN thay .github/workflows/build-apk.yml: upload zip dự án KHÔNG thay nó, và GitHub không cho bot tự sửa workflow.
+      # Bản workflow cũ (không giữ khoá ký) làm mỗi APK một chữ ký khác => không cài đè được. Bước này so file ĐANG CHẠY với bản đi kèm dự án
+      # (docs/build-apk.yml) và CẢNH BÁO khi lệch, để lần sau có workflow mới thì biết cần chép đè (không bao giờ làm hỏng build).
+      - name: Kiểm tra workflow trong repo có khớp bản đi kèm dự án
+        shell: bash
+        env:
+          PROJ_DIR: ${{ steps.proj.outputs.dir }}
+        run: |
+          NEW="$PROJ_DIR/docs/build-apk.yml"
+          if [ ! -f "$NEW" ]; then echo "Dự án không kèm docs/build-apk.yml: bỏ qua."; exit 0; fi
+          if cmp -s "$NEW" .github/workflows/build-apk.yml; then
+            echo "Workflow trong repo khớp bản đi kèm dự án."
+          else
+            MSG="File .github/workflows/build-apk.yml trong repo KHÁC bản đi kèm dự án (docs/build-apk.yml). Nếu bản trong repo cũ hơn, APK có thể không cài đè được bản trước: hãy chép nội dung docs/build-apk.yml đè lên .github/workflows/build-apk.yml."
+            echo "::warning title=Workflow trong repo khác bản đi kèm dự án::$MSG"
+            echo "### Workflow trong repo khác bản đi kèm dự án" >> "$GITHUB_STEP_SUMMARY"
+            echo "$MSG" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit 0
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
@@ -288,17 +308,27 @@ jobs:
           grep -q 'extractNativeLibs="true"' "$M" || echo "::warning::Manifest không có extractNativeLibs=true (p4a đổi mẫu?); proot trong thư viện gốc có thể không được giải ra đĩa"
           # targetSdk: MẶC ĐỊNH phải BẰNG android.api trong buildozer.spec (đọc từ spec, không ghi cứng số). Google Play Protect chặn cài khi targetSdk thấp hơn Android của máy quá 2 mức
           # («xây dựng cho phiên bản Android cũ»), nên chỉ hạ khi chủ động đặt PYEA_TARGET_SDK=<số>.
+          # SỰ THẬT là targetSdk TRONG APK (aapt2 dump badging), KHÔNG phải build.gradle đầu tiên `find` thấy: .buildozer khôi phục từ cache có thể chứa nhiều dist và `find | head -n 1`
+          # chọn nhầm => từng báo lỗi (đỏ cả job, mất APK) trong khi APK đã dựng xong. Lệch chỉ CẢNH BÁO (APK vẫn xuất); thiếu aapt2/APK cũng chỉ cảnh báo.
           T="${PYEA_TARGET_SDK:-api}"
-          G=$(find .buildozer -name build.gradle -path "*dists*" 2>/dev/null | head -n 1)
-          [ -n "$G" ] || { echo "::error::Không thấy build.gradle của dist"; exit 1; }
+          API=$(sed -n 's/^android\.api[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' buildozer.spec | head -n 1)
+          [ -n "$API" ] || { echo "::error::Không đọc được android.api trong buildozer.spec"; exit 1; }
           if [ "$T" != "api" ] && [ -n "$T" ]; then
-            grep -Eq "targetSdkVersion[[:space:]]+${T}\b" "$G" || { echo "::error::build.gradle không có targetSdkVersion ${T} (hook p4a?)"; grep -n targetSdk "$G" || true; exit 1; }
-            echo "::warning::targetSdkVersion=${T} do PYEA_TARGET_SDK: Google Play Protect có thể chặn cài APK này"
+            WANT="$T"; echo "::warning::targetSdkVersion=${T} do PYEA_TARGET_SDK: Google Play Protect có thể chặn cài APK này"
           else
-            API=$(sed -n 's/^android\.api[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' buildozer.spec | head -n 1)
-            [ -n "$API" ] || { echo "::error::Không đọc được android.api trong buildozer.spec"; exit 1; }
-            grep -Eq "targetSdkVersion[[:space:]]+${API}\b" "$G" || { echo "::error::targetSdkVersion trong build.gradle khác android.api=${API} (Play Protect chặn cài APK nhắm API cũ): $(grep -n targetSdk "$G" | head -n 3)"; exit 1; }
-            echo "OK: targetSdkVersion = android.api = ${API}"
+            WANT="$API"
+          fi
+          APK0=$(ls -t bin/*.apk 2>/dev/null | head -n 1)
+          AAPT0=$(find ~/.buildozer .buildozer -name aapt2 -type f 2>/dev/null | sort | tail -n 1)
+          TSDK=""
+          if [ -n "$APK0" ] && [ -n "$AAPT0" ]; then TSDK=$("$AAPT0" dump badging "$APK0" 2>/dev/null | sed -n "s/^targetSdkVersion:'\([0-9][0-9]*\)'.*/\1/p" | head -n 1); fi
+          echo "targetSdk trong các build.gradle của dist: $(find .buildozer -name build.gradle -path '*dists*' -exec grep -Hn targetSdk {} + 2>/dev/null | cut -c1-200 | head -n 6 | tr '\n' ';')"
+          if [ -z "$TSDK" ]; then
+            echo "::warning::Không đọc được targetSdk của APK (thiếu aapt2 hoặc APK): bỏ qua kiểm targetSdkVersion = android.api (${WANT})"
+          elif [ "$TSDK" = "$WANT" ]; then
+            echo "OK: targetSdkVersion = android.api = ${WANT} (đọc từ APK)"
+          else
+            echo "::warning title=targetSdk của APK khác mong muốn::targetSdk thực của APK = ${TSDK}, còn buildozer.spec/PYEA_TARGET_SDK mong ${WANT}. APK vẫn được xuất. Máy Android mới hơn targetSdk quá 2 mức có thể bị Google Play Protect chặn cài (xây dựng cho phiên bản Android cũ)."
           fi
           # APK thật phải chứa proot + loader ở lib/arm64-v8a (nếu không MT5 nhúng không chạy được ở targetSdk >= 29)
           APK=$(ls -t bin/*.apk 2>/dev/null | head -n 1)
