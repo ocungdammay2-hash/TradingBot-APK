@@ -5,6 +5,15 @@ on:
     branches: [main, master]
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      archs:
+        description: 'Kiến trúc CPU. Chọn arm64-v8a để build nhanh gần gấp đôi (MT5 nhúng chỉ chạy trên máy 64-bit); spec = theo buildozer.spec'
+        type: choice
+        default: spec
+        options:
+          - spec
+          - arm64-v8a
+          - 'arm64-v8a, armeabi-v7a'
 
 permissions:
   contents: write
@@ -14,6 +23,9 @@ jobs:
     # ubuntu-22.04: cần libtinfo5 (không có trên 24.04)
     runs-on: ubuntu-22.04
     timeout-minutes: 150
+    env:
+      KS_B64: ${{ secrets.PYEA_KEYSTORE_B64 }}      # khoá ký APK cố định (tuỳ chọn; rỗng = dùng cache/tạo mới)
+      KS_SEED: ${{ secrets.PYEA_KEY_SEED }}          # HẠT GIỐNG khoá ký (tuỳ chọn, DỄ NHẤT: một chuỗi chữ dài bất kỳ >= 32 ký tự): dựng khoá giống hệt mỗi lần build, không phụ thuộc cache/nhánh
     steps:
       - uses: actions/checkout@v4
 
@@ -66,19 +78,145 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # Khôi phục cache (SDK/NDK/p4a đã tải + phần đã biên dịch). Cache được LƯU CẢ KHI BUILD LỖI (bước 'Save cache')
-      # nên lần chạy lại không phải làm lại từ đầu.
-      - name: Restore cache
+      # Chỉ khi chạy tay và chọn kiến trúc khác 'spec': sửa android.archs TRƯỚC khi tính mã băm cache (cache theo từng bộ kiến trúc).
+      - name: Chọn kiến trúc CPU (chạy tay)
+        if: github.event_name == 'workflow_dispatch' && inputs.archs != 'spec' && inputs.archs != ''
+        working-directory: ${{ steps.proj.outputs.dir }}
+        shell: bash
+        env:
+          ARCHS: ${{ inputs.archs }}
+        run: |
+          sed -i -E "s/^android\.archs[[:space:]]*=.*/android.archs = ${ARCHS}/" buildozer.spec
+          grep -n '^android.archs' buildozer.spec
+
+      # MÃ BĂM CHO CACHE (tools/ci_fingerprint.py). Trước đây khoá = hashFiles('**/buildozer.spec'): file đó có dòng `version = ...` nên MỖI LẦN
+      # tăng phiên bản khoá đổi => mất sạch cache => build lại từ đầu (tải SDK/NDK + biên dịch lại python/kivy/SDL2 cho mọi kiến trúc).
+      # Giờ chỉ băm những thứ thật sự quyết định phần đã biên dịch: đổi phiên bản/mã nguồn/quyền/dịch vụ của app KHÔNG làm mất cache.
+      - name: Mã băm cache
+        id: fp
+        working-directory: ${{ steps.proj.outputs.dir }}
+        shell: bash
+        run: |
+          python tools/ci_fingerprint.py buildozer.spec --github-output "$GITHUB_OUTPUT"
+          echo "week=$(date -u +%G-%V)" >> "$GITHUB_OUTPUT"
+
+      # 4 cache riêng (mỗi cái chỉ LƯU khi chưa có đúng khoá đó => lần build sau không tải lên lại vài GB, và không đẩy cache khác ra khỏi hạn mức 10 GB):
+      #  1) công cụ  : SDK + NDK + python-for-android (~/.buildozer)  - đổi khi đổi API/NDK/p4a
+      #  2) biên dịch: phần python/kivy/SDL2... đã biên dịch (.buildozer của dự án) - đổi khi đổi requirements/kiến trúc/recipe
+      #  3) Gradle   : thư viện Gradle/AGP đã tải (~/.gradle) - làm mới mỗi tuần
+      #  4) ccache   : kết quả biên dịch C để lần biên dịch lại (khi đổi requirements) nhanh hơn
+      # Build LỖI giữa chừng vẫn lưu phần đã biên dịch (khoá '-partial-') để lần chạy lại không làm lại từ đầu; build THÀNH CÔNG lưu khoá '-ok'.
+      - name: Cache 1/4 - công cụ (SDK/NDK/p4a)
+        id: c_tool
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.buildozer
+          key: bz-tool-v4-${{ runner.os }}-${{ steps.fp.outputs.tool }}
+
+      - name: Cache 2/4 - phần đã biên dịch
+        id: c_comp
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.proj.outputs.dir }}/.buildozer
+          key: bz-comp-v4-${{ runner.os }}-${{ steps.fp.outputs.comp }}-ok
+          restore-keys: |
+            bz-comp-v4-${{ runner.os }}-${{ steps.fp.outputs.comp }}-partial-
+
+      - name: Cache 3/4 - Gradle
+        id: c_grad
         uses: actions/cache/restore@v4
         with:
           path: |
-            ~/.buildozer
-            ${{ steps.proj.outputs.dir }}/.buildozer
-          # v3: đổi tiền tố để bỏ cache cũ (từng chứa dist Gradle của p4a bản cũ: AGP 8.1 + jcenter => 'Could not find kxml2/guava...').
-          # Chỉ khôi phục cache CÙNG buildozer.spec (đã gồm p4a.branch/api/ndk); KHÔNG còn restore-key rộng 'buildozer-Linux-'.
-          key: buildozer-v3-${{ runner.os }}-${{ hashFiles('**/buildozer.spec') }}-${{ github.run_id }}
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-v1-${{ runner.os }}-${{ steps.fp.outputs.tool }}-${{ steps.fp.outputs.week }}
           restore-keys: |
-            buildozer-v3-${{ runner.os }}-${{ hashFiles('**/buildozer.spec') }}-
+            gradle-v1-${{ runner.os }}-${{ steps.fp.outputs.tool }}-
+
+      - name: Cache 4/4 - ccache
+        id: c_cc
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.ccache
+          key: ccache-v1-${{ runner.os }}-${{ steps.fp.outputs.comp }}
+          restore-keys: |
+            ccache-v1-${{ runner.os }}-
+
+      # KHOÁ KÝ APK. Mỗi máy chủ build là máy mới: nếu không có khoá cố định, Gradle tự tạo khoá debug NGẪU NHIÊN => mỗi bản APK ký bằng khoá khác
+      # => Android KHÔNG cho cài đè bản cũ («Ứng dụng chưa được cài đặt» / phải gỡ trước) => gỡ app = mất toàn bộ dữ liệu trong app, gồm cả hệ Ubuntu + Wine + MT5 đã cài
+      # (hàng GB, ~20 phút+ mỗi lần). Khoá cố định lấy theo thứ tự: (1) secret PYEA_KEYSTORE_B64 (bền nhất, xem docs/MT5_QUICK.md);
+      # (2) NHÁNH `pyea-signing-key` của chính repo (tools/ci_signing_key.sh; CHỈ khi repo RIÊNG TƯ, vì khoá nằm trong repo; không phụ thuộc cache);
+      # (3) cache 'pyea-debug-keystore-v1' (chỉ thấy được từ cùng nhánh/nhánh mặc định, bị xoá sau 7 ngày không dùng); (4) tạo mới (phải gỡ bản cũ MỘT lần).
+      # Khoá mới tạo được LƯU NGAY (cache + nhánh repo) chứ không đợi build xong: bản cũ dùng cache@v4 chỉ lưu khi CẢ job thành công, nên build đầu tiên mà lỗi giữa chừng
+      # thì khoá mất và lần sau lại tạo khoá khác (phải gỡ app thêm lần nữa). Hai bước lưu có continue-on-error: lỗi lưu khoá không bao giờ làm hỏng build.
+      - name: Khoá ký APK - khôi phục từ nhánh pyea-signing-key của repo (repo riêng tư)
+        id: ks_branch
+        if: env.KS_B64 == '' && env.KS_SEED == ''
+        working-directory: ${{ steps.proj.outputs.dir }}
+        shell: bash
+        env:
+          REPO_PRIVATE: ${{ github.event.repository.private }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/ci_signing_key.sh restore ~/.android/debug.keystore
+
+      - name: Khoá ký APK - khôi phục từ cache
+        id: c_ks
+        if: env.KS_B64 == '' && env.KS_SEED == '' && steps.ks_branch.outputs.restored != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: pyea-debug-keystore-v1
+
+      - name: Khoá ký APK - chuẩn bị
+        id: sign
+        working-directory: ${{ steps.proj.outputs.dir }}
+        shell: bash
+        run: |
+          mkdir -p ~/.android
+          KS=~/.android/debug.keystore
+          if [ -n "$KS_B64" ]; then
+            printf '%s' "$KS_B64" | base64 -d > "$KS" || { echo "::error::Secret PYEA_KEYSTORE_B64 không phải base64 hợp lệ"; exit 1; }
+            SRC="secret PYEA_KEYSTORE_B64"
+          elif [ -n "$KS_SEED" ]; then
+            # khoá dẫn xuất TẤT ĐỊNH từ hạt giống (tools/ci_derive_keystore.py): cùng hạt giống => cùng khoá, không cần cache/nhánh, dùng được cả repo công khai
+            python3 -m pip install --quiet --disable-pip-version-check cryptography >/dev/null 2>&1 || true
+            rm -f "$KS"
+            D="$(python3 tools/ci_derive_keystore.py "$KS")" || { echo "::error::Secret PYEA_KEY_SEED không dùng được (cần chuỗi >= 32 ký tự, và pip cài được cryptography). Sửa secret hoặc xoá nó."; exit 1; }
+            SRC="secret PYEA_KEY_SEED (khoá dẫn xuất từ hạt giống)"
+            echo "Khoá dẫn xuất từ hạt giống: vân tay $D"
+          elif [ -s "$KS" ]; then
+            if [ "${{ steps.ks_branch.outputs.restored }}" = true ]; then SRC="nhánh pyea-signing-key của repo"; else SRC="cache (khoá giữ từ lần build trước)"; fi
+          else
+            keytool -genkeypair -keystore "$KS" -storepass android -keypass android -alias androiddebugkey \
+              -keyalg RSA -keysize 2048 -validity 36500 -dname "CN=PyEA Debug,O=PyEA,C=VN" >/dev/null 2>&1 \
+              || { echo "::error::Không tạo được khoá ký (keytool)"; exit 1; }
+            SRC="TẠO MỚI lần này"
+            echo "created=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::Khoá ký APK vừa được TẠO MỚI: APK này khác chữ ký với bản cài trước => gỡ app cũ MỘT lần rồi cài. Khoá được lưu ngay (nhánh pyea-signing-key nếu repo riêng tư, và cache) nên từ lần sau cài đè được. Để khoá không bao giờ mất, đặt secret PYEA_KEYSTORE_B64 (docs/MT5_QUICK.md)."
+          fi
+          FP=$(keytool -list -v -keystore "$KS" -storepass android -alias androiddebugkey 2>/dev/null | sed -n 's/^[[:space:]]*SHA256:[[:space:]]*//p' | head -n 1)
+          [ -n "$FP" ] || { echo "::error::Không đọc được khoá androiddebugkey trong keystore (alias phải là androiddebugkey, mật khẩu android)"; exit 1; }
+          echo "fp=$FP" >> "$GITHUB_OUTPUT"
+          echo "src=$SRC" >> "$GITHUB_OUTPUT"
+          echo "Khoá ký: $SRC; dấu vân tay SHA-256 = $FP (giống nhau giữa các lần build = cài đè được)"
+
+      - name: Khoá ký APK - lưu vào cache NGAY (không đợi build xong)
+        if: env.KS_B64 == '' && env.KS_SEED == '' && steps.sign.outputs.created == 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: pyea-debug-keystore-v1
+
+      - name: Khoá ký APK - ghi vào nhánh pyea-signing-key của repo (repo riêng tư)
+        if: env.KS_B64 == '' && env.KS_SEED == '' && steps.ks_branch.outputs.restored != 'true'
+        continue-on-error: true
+        working-directory: ${{ steps.proj.outputs.dir }}
+        shell: bash
+        env:
+          REPO_PRIVATE: ${{ github.event.repository.private }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/ci_signing_key.sh save ~/.android/debug.keystore
 
       - name: System dependencies
         run: |
@@ -103,6 +241,7 @@ jobs:
 
       # Dist Gradle (do p4a sinh ra từ template) KHÔNG được dùng lại từ cache: dist cũ có AGP/jcenter của p4a bản cũ -> Gradle không tải được thư viện.
       # Xoá riêng thư mục dists (phần đã biên dịch python/kivy/NDK vẫn giữ nên không mất 30-60 phút); p4a dựng lại dist từ template mới.
+      # (Cache mới cũng đã dọn dists/venv trước khi lưu - bước 'Dọn trước khi lưu cache' - nên ở đây thường chẳng còn gì để xoá.)
       # Cũng xoá venv công cụ của p4a (build-*/build/venv): venv cũ từ cache + `python -m venv` của p4a (cài pip 25.3 đóng gói đè lên pip 26.x)
       # => pip bị «lai» => ImportError 'capture_logging' (HANDOFF 5bl). Phần module đã cài nằm ở python-installs nên không mất.
       - name: Drop stale p4a dist (giữ phần đã biên dịch)
@@ -118,14 +257,21 @@ jobs:
           true
 
       - name: Build debug APK
+        id: build
         working-directory: ${{ steps.proj.outputs.dir }}
         shell: bash
         run: |
           set -o pipefail
+          # ccache: p4a tự dùng nếu có (USE_CCACHE mặc định bật); đặt thư mục + hạn mức để cache 4/4 lưu được gọn.
+          export CCACHE_DIR="$HOME/.ccache" CCACHE_MAXSIZE=800M CCACHE_COMPRESS=1
+          mkdir -p "$CCACHE_DIR"; ccache -z >/dev/null 2>&1 || true
+          T0=$(date +%s)
           # Cấm pip chọn wheel Android biên dịch của charset-normalizer và ghim pip 25.3 trong venv p4a (xem tools/p4a_constraints.txt; HANDOFF 5bk, 5bl).
           export PIP_CONSTRAINT="$PWD/tools/p4a_constraints.txt"
           [ -f "$PIP_CONSTRAINT" ] || { echo "::error::thiếu $PIP_CONSTRAINT"; exit 1; }
           buildozer -v android debug 2>&1 | tee build.log
+          echo "Thời gian buildozer: $(( $(date +%s) - T0 )) giây" | tee -a "$GITHUB_STEP_SUMMARY"
+          ccache -s 2>/dev/null | sed 's/^/ccache: /' | head -n 12 || true
 
       # Kiểm tra manifest cuối cùng có BootReceiver + quyền khởi động (hook tools/p4a_hook.py chèn). Thiếu -> báo lỗi rõ ràng thay vì im lặng.
       - name: Verify boot receiver in manifest
@@ -137,15 +283,116 @@ jobs:
           grep -q "org.pyea.pyearunner.BootReceiver" "$M" || { echo "::error::Manifest thiếu BootReceiver (hook p4a không chạy?)"; exit 1; }
           grep -q "RECEIVE_BOOT_COMPLETED" "$M" || { echo "::error::Manifest thiếu RECEIVE_BOOT_COMPLETED"; exit 1; }
           echo "OK: $M có BootReceiver"
+          # MT5 nhúng (pyea/embedded.py): cần dịch vụ Emu và proot đóng gói trong APK (native_libs/arm64-v8a -> thư viện gốc). Thiếu -> báo lỗi rõ ràng.
+          grep -q "ServiceEmu" "$M" || { echo "::error::Manifest thiếu ServiceEmu (services trong buildozer.spec?)"; exit 1; }
+          grep -q 'extractNativeLibs="true"' "$M" || echo "::warning::Manifest không có extractNativeLibs=true (p4a đổi mẫu?); proot trong thư viện gốc có thể không được giải ra đĩa"
+          # targetSdk: MẶC ĐỊNH phải BẰNG android.api trong buildozer.spec (đọc từ spec, không ghi cứng số). Google Play Protect chặn cài khi targetSdk thấp hơn Android của máy quá 2 mức
+          # («xây dựng cho phiên bản Android cũ»), nên chỉ hạ khi chủ động đặt PYEA_TARGET_SDK=<số>.
+          T="${PYEA_TARGET_SDK:-api}"
+          G=$(find .buildozer -name build.gradle -path "*dists*" 2>/dev/null | head -n 1)
+          [ -n "$G" ] || { echo "::error::Không thấy build.gradle của dist"; exit 1; }
+          if [ "$T" != "api" ] && [ -n "$T" ]; then
+            grep -Eq "targetSdkVersion[[:space:]]+${T}\b" "$G" || { echo "::error::build.gradle không có targetSdkVersion ${T} (hook p4a?)"; grep -n targetSdk "$G" || true; exit 1; }
+            echo "::warning::targetSdkVersion=${T} do PYEA_TARGET_SDK: Google Play Protect có thể chặn cài APK này"
+          else
+            API=$(sed -n 's/^android\.api[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' buildozer.spec | head -n 1)
+            [ -n "$API" ] || { echo "::error::Không đọc được android.api trong buildozer.spec"; exit 1; }
+            grep -Eq "targetSdkVersion[[:space:]]+${API}\b" "$G" || { echo "::error::targetSdkVersion trong build.gradle khác android.api=${API} (Play Protect chặn cài APK nhắm API cũ): $(grep -n targetSdk "$G" | head -n 3)"; exit 1; }
+            echo "OK: targetSdkVersion = android.api = ${API}"
+          fi
+          # APK thật phải chứa proot + loader ở lib/arm64-v8a (nếu không MT5 nhúng không chạy được ở targetSdk >= 29)
+          APK=$(ls -t bin/*.apk 2>/dev/null | head -n 1)
+          if [ -n "$APK" ]; then
+            LIST=$(unzip -l "$APK")
+            for f in libproot.so libproot_a10.so libproot_loader.so libproot_loader32.so libpyea_talloc.so libpyea_talloc_a10.so; do
+              echo "$LIST" | grep -q "lib/arm64-v8a/$f" || { echo "::error::APK thiếu lib/arm64-v8a/$f (buildozer.spec: android.add_libs_arm64_v8a?)"; exit 1; }
+            done
+            echo "OK: $APK có proot + loader trong lib/arm64-v8a"
+            AAPT=$(find ~/.buildozer .buildozer -name aapt2 -type f 2>/dev/null | head -n 1)
+            if [ -n "$AAPT" ]; then "$AAPT" dump badging "$APK" 2>/dev/null | grep -E "^(sdkVersion|targetSdkVersion)" || true; fi
+            # Chữ ký APK phải TRÙNG khoá cố định (nếu không Android không cho cài đè bản cũ và mất dữ liệu app).
+            ASIGN=$(find ~/.buildozer .buildozer -name apksigner -type f 2>/dev/null | sort | tail -n 1)
+            if [ -n "$ASIGN" ]; then
+              APKFP=$("$ASIGN" verify --print-certs "$APK" 2>/dev/null | sed -n 's/.*certificate SHA-256 digest: *//p' | head -n 1 | tr 'a-f' 'A-F' | sed 's/../&:/g; s/:$//')
+              WANT="${{ steps.sign.outputs.fp }}"
+              echo "Chữ ký APK (SHA-256): ${APKFP:-?}"
+              if [ -n "$APKFP" ] && [ "$APKFP" != "$WANT" ]; then
+                echo "::warning::APK KHÔNG ký bằng khoá cố định ($WANT): Gradle không dùng ~/.android/debug.keystore? Cài đè sẽ lỗi, phải gỡ app cũ."
+              else
+                echo "OK: APK ký bằng khoá cố định - cài đè được bản cũ, giữ dữ liệu app"
+              fi
+            else
+              echo "::warning::Không tìm thấy apksigner để kiểm chữ ký APK"
+            fi
+          else
+            echo "::warning::Không thấy bin/*.apk để kiểm proot trong APK"
+          fi
 
-      - name: Save cache
+      # Dọn thứ KHÔNG nên nằm trong cache trước khi lưu: dist Gradle (sinh lại mỗi lần từ template) và venv công cụ của p4a (xem bước 'Drop stale').
+      - name: Dọn trước khi lưu cache
         if: always()
+        working-directory: ${{ steps.proj.outputs.dir }}
+        shell: bash
+        run: |
+          for d in .buildozer/android/platform/build-*/dists .buildozer/android/platform/build-*/build/venv \
+                   ~/.buildozer/android/platform/build-*/dists ~/.buildozer/android/platform/build-*/build/venv; do
+            [ -e "$d" ] && rm -rf "$d"
+          done
+          du -sh ~/.buildozer .buildozer ~/.gradle/caches ~/.gradle/wrapper ~/.ccache 2>/dev/null | sed 's/^/kích thước cache: /' || true
+
+      # Chỉ lưu khi CHƯA có đúng khoá đó (cache-hit != 'true'): build lần sau không tải lên lại vài GB.
+      - name: Lưu cache 1/4 - công cụ
+        if: always() && steps.build.outcome == 'success' && steps.c_tool.outputs.cache-hit != 'true'   # chỉ lưu khi build thành công: tránh đóng băng SDK/NDK tải dở dưới đúng khoá này
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.buildozer
+          key: bz-tool-v4-${{ runner.os }}-${{ steps.fp.outputs.tool }}
+
+      - name: Lưu cache 2/4 - phần đã biên dịch (build thành công)
+        if: always() && steps.build.outcome == 'success' && steps.c_comp.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.proj.outputs.dir }}/.buildozer
+          key: bz-comp-v4-${{ runner.os }}-${{ steps.fp.outputs.comp }}-ok
+
+      - name: Lưu cache 2/4 - phần đã biên dịch (build lỗi - giữ phần đã làm)
+        if: always() && steps.build.outcome == 'failure'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.proj.outputs.dir }}/.buildozer
+          key: bz-comp-v4-${{ runner.os }}-${{ steps.fp.outputs.comp }}-partial-${{ github.run_id }}
+
+      - name: Lưu cache 3/4 - Gradle
+        if: always() && steps.build.outcome == 'success' && steps.c_grad.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
           path: |
-            ~/.buildozer
-            ${{ steps.proj.outputs.dir }}/.buildozer
-          key: buildozer-v3-${{ runner.os }}-${{ hashFiles('**/buildozer.spec') }}-${{ github.run_id }}
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-v1-${{ runner.os }}-${{ steps.fp.outputs.tool }}-${{ steps.fp.outputs.week }}
+
+      - name: Lưu cache 4/4 - ccache
+        if: always() && steps.build.outcome == 'success' && steps.c_cc.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.ccache
+          key: ccache-v1-${{ runner.os }}-${{ steps.fp.outputs.comp }}
+
+      - name: Tóm tắt cache và chữ ký
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Cache và chữ ký APK"
+            echo "| Mục | Kết quả |"
+            echo "|---|---|"
+            echo "| Công cụ (SDK/NDK/p4a) | ${{ steps.c_tool.outputs.cache-hit == 'true' && 'TRÚNG' || 'trượt (tải mới)' }} (mã ${{ steps.fp.outputs.tool }}) |"
+            echo "| Phần đã biên dịch | ${{ steps.c_comp.outputs.cache-hit == 'true' && 'TRÚNG' || (steps.c_comp.outputs.cache-matched-key != '' && 'một phần (build lỗi lần trước)' || 'trượt (biên dịch lại từ đầu)') }} (mã ${{ steps.fp.outputs.comp }}) |"
+            echo "| Gradle | ${{ steps.c_grad.outputs.cache-hit == 'true' && 'TRÚNG' || (steps.c_grad.outputs.cache-matched-key != '' && 'tuần trước (làm mới)' || 'trượt') }} |"
+            echo "| ccache | ${{ steps.c_cc.outputs.cache-hit == 'true' && 'TRÚNG' || (steps.c_cc.outputs.cache-matched-key != '' && 'từ bản trước' || 'trượt') }} |"
+            echo "| Khoá ký APK | ${{ steps.sign.outputs.src }} |"
+            echo "| Dấu vân tay khoá | ${{ steps.sign.outputs.fp }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # Log buildozer rất dài nên giao diện GitHub hay cắt mất dòng lỗi: in riêng phần lỗi ở đây.
       - name: Show error summary
