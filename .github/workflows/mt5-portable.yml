@@ -1,0 +1,156 @@
+# Lay thu muc MetaTrader 5 (dang .zip) ma KHONG can may Windows.
+#
+# GitHub cho muon mien phi mot may Windows trong vai phut: workflow nay cai MT5 len do, nen thu muc da cai thanh
+# MOT FILE ZIP ("artifact"), ban tai ve dien thoai roi chon trong app (Ket noi MT5 nhanh -> "Chon tep .zip MT5").
+#
+# CACH DUNG (chi can dien thoai):
+#   1. Repo tren GitHub -> Add file -> Create new file -> ten:  .github/workflows/mt5-portable.yml
+#      -> dan toan bo noi dung file nay -> Commit.
+#      (File zip du an KHONG tu them workflow moi vao repo; phai tao tay nhu build-apk.yml.)
+#   2. Tab Actions -> chon "Lay thu muc MT5 (zip)" ben trai -> Run workflow -> Run workflow. Cho ~5-10 phut.
+#   3. Mo lan chay xong -> keo xuong muc Artifacts -> bam "mt5-portable" de tai ve (can dang nhap GitHub).
+#      Dien thoai luu file .zip vao Downloads.
+#   4. App PyEA -> Ket noi MT5 nhanh -> "Chon tep .zip MT5" -> chon file vua tai -> nhap login/mat khau/server -> Bat dau.
+#
+# LUU Y THANG THAN:
+#   - CHUA CHAY THAT tren GitHub. Neu buoc nao do, gui lai anh/chu cua buoc loi.
+#   - CHUA BIET terminal64.exe co chay duoc duoi Wine+Box64 tren dien thoai hay khong (bo cai mt5setup.exe thi da biet la
+#     quay vong). Day chi la thu bo qua buoc cai.
+#   - Repo CONG KHAI: artifact cua repo cong khai ai dang nhap GitHub cung tai duoc trong thoi gian luu (retention).
+#     Vi vay file chi luu 3 ngay va chi chua phan mem MT5 chua dang nhap (khong co tai khoan, khong co mat khau).
+#     Hay xoa artifact sau khi tai (Actions -> lan chay -> thung rac canh artifact). Phan mem MetaTrader thuoc MetaQuotes:
+#     chi dung cho ban than, dung dua ban zip len noi cong khai.
+name: Lay thu muc MT5 (zip)
+
+on:
+  workflow_dispatch:
+    inputs:
+      setup_url:
+        description: "Link bo cai MT5 cua san (https://...). De trong = ban chung cua MetaQuotes"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  mt5:
+    name: Cai MT5 tren Windows va dong goi
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - name: Tai bo cai MT5
+        shell: pwsh
+        env:
+          SETUP_URL: ${{ inputs.setup_url }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = ($env:SETUP_URL).Trim()
+          if ([string]::IsNullOrWhiteSpace($url)) {
+            $url = 'https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5setup.exe'
+          }
+          if ($url -notmatch '^https://[^\s]+$') { throw "Link phai bat dau bang https:// va khong co khoang trang" }
+          $exe = Join-Path $env:RUNNER_TEMP 'mt5setup.exe'
+          Invoke-WebRequest -Uri $url -OutFile $exe -UseBasicParsing
+          $f = Get-Item $exe
+          Write-Host ("Da tai {0} byte" -f $f.Length)
+          $head = [IO.File]::ReadAllBytes($exe)[0..1]
+          if ($head[0] -ne 0x4D -or $head[1] -ne 0x5A) { throw "Tep tai ve khong phai chuong trinh .exe (link hong hoac bi chan)" }
+          "EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Cai MT5 (im lang) va doi terminal64.exe
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $roots = @('C:\Program Files', 'C:\Program Files (x86)')
+          function Find-Terminal {
+            foreach ($r in $roots) {
+              if (-not (Test-Path $r)) { continue }
+              foreach ($d in (Get-ChildItem $r -Directory -ErrorAction SilentlyContinue)) {
+                $t = Join-Path $d.FullName 'terminal64.exe'
+                if (Test-Path $t) { return $d.FullName }
+              }
+            }
+            return $null
+          }
+          $p = Start-Process -FilePath $env:EXE -ArgumentList '/auto' -PassThru
+          $deadline = (Get-Date).AddMinutes(20)
+          $dir = $null
+          $exitedAt = $null
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 10
+            $dir = Find-Terminal
+            if ($dir -and (Test-Path (Join-Path $dir 'metaeditor64.exe'))) { break }
+            if ($p.HasExited) {
+              if (-not $exitedAt) { $exitedAt = Get-Date; Write-Host "Bo cai da thoat (ma $($p.ExitCode)); doi them toi da 90 giay" }
+              elseif (((Get-Date) - $exitedAt).TotalSeconds -gt 90) { break }
+            }
+          }
+          if (-not $dir) { throw "Khong thay terminal64.exe trong Program Files (bo cai thoat hoac het gio)" }
+          Write-Host "Thu muc cai: $dir"
+          # cho bo cai tu thoat (no co the dang chep not) toi da 3 phut roi dung han moi tien trinh MT5
+          if (-not $p.HasExited) { [void]$p.WaitForExit(180000) }
+          Get-Process -Name 'terminal64','metaeditor64','metatester64','mt5setup' -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep -Seconds 3
+          "MT5_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Chay thu muc o che do portable 40 giay (de no tu tao MQL5, Config) roi dung
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $t = Join-Path $env:MT5_DIR 'terminal64.exe'
+          $q = Start-Process -FilePath $t -ArgumentList '/portable' -PassThru
+          Start-Sleep -Seconds 40
+          Get-Process -Name 'terminal64','metaeditor64' -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep -Seconds 3
+          # xoa nhat ky cho nho gon; KHONG co tai khoan nao de lo vi chua dang nhap
+          foreach ($l in @('Logs', 'MQL5\Logs', 'Tester\logs')) {
+            $x = Join-Path $env:MT5_DIR $l
+            if (Test-Path $x) { Remove-Item $x -Recurse -Force -ErrorAction SilentlyContinue }
+          }
+
+      - name: Kiem tra thu muc truoc khi dong goi
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $d = $env:MT5_DIR
+          foreach ($n in @('terminal64.exe', 'metaeditor64.exe')) {
+            if (-not (Test-Path (Join-Path $d $n))) { throw "Thieu $n trong $d" }
+          }
+          $files = Get-ChildItem $d -Recurse -File -Force -ErrorAction SilentlyContinue
+          $mb = [math]::Round((($files | Measure-Object Length -Sum).Sum) / 1MB, 1)
+          # May Windows nay moi tinh, chua dang nhap tai khoan nao nen khong co du lieu rieng. Cho chac: tep danh sach tai khoan
+          # thi xoa khoi ban dong goi; tep co ten giong khoa chi canh bao (co the la tep cua MetaQuotes).
+          $acc = $files | Where-Object { $_.Name -match '^(accounts|passwords?)\.' }
+          foreach ($a in $acc) { Write-Host "Xoa khoi ban dong goi: $($a.FullName)"; Remove-Item $a.FullName -Force }
+          $keys = $files | Where-Object { $_.Name -match '\.(pem|pfx|key|jks|keystore)$' }
+          foreach ($k in $keys) { Write-Host "::warning title=Tep ten giong khoa::$($k.FullName)" }
+          $sig = Get-AuthenticodeSignature (Join-Path $d 'terminal64.exe')
+          $sha = (Get-FileHash (Join-Path $d 'terminal64.exe') -Algorithm SHA256).Hash
+          $sum = @(
+            "## Thu muc MetaTrader 5 da dong goi",
+            "",
+            "- Thu muc: ``$d``",
+            "- So tep: $($files.Count) - dung luong: $mb MB",
+            "- terminal64.exe SHA-256: ``$sha``",
+            "- Chu ky so cua terminal64.exe: $($sig.Status)",
+            "",
+            "Tai artifact **mt5-portable** o muc Artifacts cuoi trang nay, roi chon trong app PyEA (Ket noi MT5 nhanh -> Chon tep .zip MT5)."
+          )
+          $sum -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          Write-Host ("OK: {0} tep, {1} MB" -f $files.Count, $mb)
+          # chep sang duong dan don gian (khong dau cach, khong ngoac) de buoc tai len khong vap ky tu dac biet cua glob
+          $out = Join-Path $env:RUNNER_TEMP 'mt5-portable'
+          if (Test-Path $out) { Remove-Item $out -Recurse -Force }
+          Copy-Item -Path $d -Destination $out -Recurse -Force
+          if (-not (Test-Path (Join-Path $out 'terminal64.exe'))) { throw "Chep thu muc that bai" }
+          ("OUT_DIR=" + $out.Replace('\', '/')) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Dong goi thanh artifact (zip, tep nam o goc)
+        uses: actions/upload-artifact@v4
+        with:
+          name: mt5-portable
+          path: ${{ env.OUT_DIR }}
+          retention-days: 3
+          compression-level: 6
+          if-no-files-found: error
