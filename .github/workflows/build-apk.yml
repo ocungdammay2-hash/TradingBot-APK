@@ -298,14 +298,33 @@ jobs:
         working-directory: ${{ steps.proj.outputs.dir }}
         shell: bash
         run: |
-          M=$(find .buildozer -path "*src/main/AndroidManifest.xml" 2>/dev/null | head -n 1)
+          # SỰ THẬT là manifest TRONG APK vừa dựng (aapt2 dump xmltree), KHÔNG phải tệp đầu tiên `find` thấy: .buildozer khôi phục từ cache có thể chứa NHIỀU dist cũ
+          # (vd build-arm64-v8a/ lẫn build-arm64-v8a_armeabi-v7a/) và `find | head -n 1` chọn nhầm dist cũ => run #169: «Manifest thiếu BootReceiver» dù hook đã chèn
+          # (log ghi «p4a_hook: chèn BootReceiver») và APK dựng xong. Không đọc được manifest trong APK thì dùng tệp dists/*/src/main/AndroidManifest.xml MỚI NHẤT (theo giờ sửa).
+          APKM=$(ls -t bin/*.apk 2>/dev/null | head -n 1)
+          AAPTM=$(find ~/.buildozer .buildozer -name aapt2 -type f 2>/dev/null | sort | tail -n 1)
+          CANDS=$(find .buildozer -path "*src/main/AndroidManifest.xml" -type f 2>/dev/null | while read -r f; do printf '%s %s\n' "$(stat -c %Y "$f" 2>/dev/null || echo 0)" "$f"; done | sort -rn | cut -d' ' -f2- || true)
+          for f in $CANDS; do
+            echo "Chẩn đoán manifest: $f -> $(grep -c 'org.pyea.pyearunner.BootReceiver' "$f" 2>/dev/null || true) chỗ có BootReceiver; sửa lúc $(stat -c %y "$f" 2>/dev/null | cut -c1-19)"
+          done
+          M=""
+          MTMP="$(mktemp)"
+          if [ -n "$APKM" ] && [ -n "$AAPTM" ] && "$AAPTM" dump xmltree --file AndroidManifest.xml "$APKM" > "$MTMP" 2>/dev/null && grep -q "uses-permission" "$MTMP"; then
+            M="$MTMP"; SRC="manifest TRONG $APKM"
+          else
+            M=$(printf '%s\n' "$CANDS" | head -n 1)
+            SRC="$M (tệp mới nhất; không đọc được manifest trong APK)"
+          fi
           [ -n "$M" ] || { echo "::error::Không thấy AndroidManifest.xml đã dựng"; exit 1; }
-          grep -q "org.pyea.pyearunner.BootReceiver" "$M" || { echo "::error::Manifest thiếu BootReceiver (hook p4a không chạy?)"; exit 1; }
-          grep -q "RECEIVE_BOOT_COMPLETED" "$M" || { echo "::error::Manifest thiếu RECEIVE_BOOT_COMPLETED"; exit 1; }
-          echo "OK: $M có BootReceiver"
+          echo "Kiểm manifest: $SRC"
+          grep -q "org.pyea.pyearunner.BootReceiver" "$M" || { echo "::error::Manifest thiếu BootReceiver (hook p4a không chạy?) - đã kiểm: $SRC"; exit 1; }
+          grep -q "RECEIVE_BOOT_COMPLETED" "$M" || { echo "::error::Manifest thiếu RECEIVE_BOOT_COMPLETED - đã kiểm: $SRC"; exit 1; }
+          echo "OK: $SRC có BootReceiver"
           # MT5 nhúng (pyea/embedded.py): cần dịch vụ Emu và proot đóng gói trong APK (native_libs/arm64-v8a -> thư viện gốc). Thiếu -> báo lỗi rõ ràng.
-          grep -q "ServiceEmu" "$M" || { echo "::error::Manifest thiếu ServiceEmu (services trong buildozer.spec?)"; exit 1; }
-          grep -q 'extractNativeLibs="true"' "$M" || echo "::warning::Manifest không có extractNativeLibs=true (p4a đổi mẫu?); proot trong thư viện gốc có thể không được giải ra đĩa"
+          grep -q "ServiceEmu" "$M" || { echo "::error::Manifest thiếu ServiceEmu (services trong buildozer.spec?) - đã kiểm: $SRC"; exit 1; }
+          # tệp văn bản ghi extractNativeLibs="true"; aapt2 xmltree ghi extractNativeLibs(0x...)=true
+          echo "extractNativeLibs trong manifest đã kiểm: $(grep -Eo 'extractNativeLibs[^ >]*' "$M" | head -n 1)"
+          grep -Eq 'extractNativeLibs(\([^)]*\))?="?true"?' "$M" || echo "::warning::Manifest không có extractNativeLibs=true (p4a đổi mẫu?); proot trong thư viện gốc có thể không được giải ra đĩa"
           # targetSdk: MẶC ĐỊNH phải BẰNG android.api trong buildozer.spec (đọc từ spec, không ghi cứng số). Google Play Protect chặn cài khi targetSdk thấp hơn Android của máy quá 2 mức
           # («xây dựng cho phiên bản Android cũ»), nên chỉ hạ khi chủ động đặt PYEA_TARGET_SDK=<số>.
           # SỰ THẬT là targetSdk TRONG APK (aapt2 dump badging), KHÔNG phải build.gradle đầu tiên `find` thấy: .buildozer khôi phục từ cache có thể chứa nhiều dist và `find | head -n 1`
