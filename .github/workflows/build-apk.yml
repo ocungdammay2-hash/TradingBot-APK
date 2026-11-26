@@ -341,15 +341,51 @@ jobs:
             AAPT=$(find ~/.buildozer .buildozer -name aapt2 -type f 2>/dev/null | head -n 1)
             if [ -n "$AAPT" ]; then "$AAPT" dump badging "$APK" 2>/dev/null | grep -E "^(sdkVersion|targetSdkVersion)" || true; fi
             # Chữ ký APK phải TRÙNG khoá cố định (nếu không Android không cho cài đè bản cũ và mất dữ liệu app).
-            ASIGN=$(find ~/.buildozer .buildozer -name apksigner -type f 2>/dev/null | sort | tail -n 1)
+            # Gradle (AGP) tự chọn khoá debug của nó; nếu nó KHÔNG dùng ~/.android/debug.keystore đã chuẩn bị (run #161: «APK KHÔNG ký bằng khoá cố định»)
+            # thì KÝ LẠI APK bằng khoá cố định ngay tại đây: bỏ chữ ký cũ -> zipalign -> apksigner sign. Đây là cách làm chuẩn (căn 4 byte TRƯỚC khi ký;
+            # Android 11+ từ chối APK targetSdk>=30 nếu resources.arsc không nén + căn 4 byte), nên sau khi ký còn kiểm lại bằng zipalign -c.
+            ASIGN=$(find ~/.buildozer .buildozer -name apksigner -type f 2>/dev/null | sort | tail -n 1 || true)
             if [ -n "$ASIGN" ]; then
-              APKFP=$("$ASIGN" verify --print-certs "$APK" 2>/dev/null | sed -n 's/.*certificate SHA-256 digest: *//p' | head -n 1 | tr 'a-f' 'A-F' | sed 's/../&:/g; s/:$//')
-              WANT="${{ steps.sign.outputs.fp }}"
+              KSF=~/.android/debug.keystore
+              WANTFP="${{ steps.sign.outputs.fp }}"
+              apkfp() { { "$ASIGN" verify --print-certs "$1" 2>/dev/null | sed -n 's/.*certificate SHA-256 digest: *//p' | head -n 1 | tr 'a-f' 'A-F' | sed 's/../&:/g; s/:$//'; } || true; }
+              APKFP=$(apkfp "$APK")
               echo "Chữ ký APK (SHA-256): ${APKFP:-?}"
-              if [ -n "$APKFP" ] && [ "$APKFP" != "$WANT" ]; then
-                echo "::warning::APK KHÔNG ký bằng khoá cố định ($WANT): Gradle không dùng ~/.android/debug.keystore? Cài đè sẽ lỗi, phải gỡ app cũ."
-              else
+              echo "Khoá cố định mong muốn: ${WANTFP}"
+              KSNOW=$(keytool -list -v -keystore "$KSF" -storepass android -alias androiddebugkey 2>/dev/null | sed -n 's/^[[:space:]]*SHA256:[[:space:]]*//p' | head -n 1 || true)
+              echo "Chẩn đoán khoá: keystore sau build = ${KSNOW:-?}; ANDROID_USER_HOME='${ANDROID_USER_HOME:-}' ANDROID_SDK_HOME='${ANDROID_SDK_HOME:-}' ANDROID_PREFS_ROOT='${ANDROID_PREFS_ROOT:-}' HOME='${HOME}'"
+              for k in $(find ~ /root /home -maxdepth 4 -name debug.keystore -type f 2>/dev/null | sort -u | head -n 6 || true); do
+                echo "Chẩn đoán khoá: có debug.keystore ở $k -> $(keytool -list -v -keystore "$k" -storepass android -alias androiddebugkey 2>/dev/null | sed -n 's/^[[:space:]]*SHA256:[[:space:]]*//p' | head -n 1 || true)"
+              done
+              if [ "$APKFP" = "$WANTFP" ]; then
                 echo "OK: APK ký bằng khoá cố định - cài đè được bản cũ, giữ dữ liệu app"
+              else
+                ZA="$(dirname "$ASIGN")/zipalign"
+                [ -x "$ZA" ] || ZA=$(find ~/.buildozer .buildozer -name zipalign -type f 2>/dev/null | sort | tail -n 1 || true)
+                for A in bin/*.apk; do
+                  [ -f "$A" ] || continue
+                  TD=$(mktemp -d); SRCAPK="$A"; ALIGNED=0
+                  if [ -n "$ZA" ] && [ -x "$ZA" ]; then
+                    cp "$A" "$TD/in.apk"
+                    zip -q -d "$TD/in.apk" 'META-INF/*.SF' 'META-INF/*.RSA' 'META-INF/*.DSA' 'META-INF/*.EC' 'META-INF/MANIFEST.MF' >/dev/null 2>&1 || true
+                    if "$ZA" -p -f 4 "$TD/in.apk" "$TD/al.apk" >/dev/null 2>&1; then SRCAPK="$TD/al.apk"; ALIGNED=1; fi
+                  fi
+                  if "$ASIGN" sign --ks "$KSF" --ks-pass pass:android --key-pass pass:android --ks-key-alias androiddebugkey --out "$TD/out.apk" "$SRCAPK" >"$TD/sign.log" 2>&1; then
+                    NEWFP=$(apkfp "$TD/out.apk")
+                    if [ "$NEWFP" != "$WANTFP" ]; then
+                      echo "::warning::Đã ký lại $A nhưng chữ ký vẫn không khớp khoá cố định (${NEWFP:-?}): GIỮ NGUYÊN bản gốc. Cài đè sẽ lỗi, phải gỡ app cũ."
+                    elif [ -n "$ZA" ] && [ -x "$ZA" ] && ! "$ZA" -c 4 "$TD/out.apk" >/dev/null 2>&1; then
+                      echo "::warning::APK ký lại không qua kiểm căn 4 byte (zipalign -c): GIỮ NGUYÊN bản gốc (ký bằng khoá khác, cài đè sẽ lỗi, phải gỡ app cũ)."
+                    else
+                      mv -f "$TD/out.apk" "$A"
+                      echo "OK: đã KÝ LẠI $A bằng khoá cố định (căn zip: $([ "$ALIGNED" = 1 ] && echo đã căn || echo không có zipalign)) - cài đè được bản cũ, giữ dữ liệu app"
+                      echo "::notice title=APK đã được ký lại bằng khoá cố định::Gradle ký bằng khoá ${APKFP:-?} thay vì khoá cố định ${WANTFP}; workflow đã ký lại nên cài đè được."
+                    fi
+                  else
+                    echo "::warning::apksigner sign lỗi, GIỮ NGUYÊN APK (ký bằng khoá khác khoá cố định; cài đè sẽ lỗi, phải gỡ app cũ): $(tail -n 3 "$TD/sign.log" | tr '\n' ' ' | cut -c1-300)"
+                  fi
+                  rm -rf "$TD"
+                done
               fi
             else
               echo "::warning::Không tìm thấy apksigner để kiểm chữ ký APK"
